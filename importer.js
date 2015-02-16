@@ -159,4 +159,6 @@ var getPivotalStories = function(options) {
 };
 
 
-getPivotalStories({local: false});
+if (require.main === module) {
+  getPivotalStories({local: false});
+}
