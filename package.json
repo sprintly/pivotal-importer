@@ -6,14 +6,29 @@
   "repository": {
     "url": ""
   },
+  "scripts": {
+    "test": "mocha **/importer_test.js",
+    "coverage": "istanbul cover -x '**/*_test.js' _mocha -- `find . -name '*_test.js'`",
+    "watch": "npm-watch"
+  },
   "engines": {
     "node": "~0.6.0"
   },
   "dependencies": {
+    "async": "^0.9.0",
     "lodash": "^3.2.0",
     "querystring": "0.1.x",
     "request": "^2.53.0",
     "xml2json": "0.5.x"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "istanbul": "^0.3.6",
+    "mocha": "^2.1.0",
+    "mocha-istanbul": "^0.2.0",
+    "nock": "^0.59.1",
+    "npm-watch": "0.0.0"
+  },
+  "watch": {
+    "coverage": "importer*.js"
+  }
 }

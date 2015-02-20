@@ -1,41 +1,60 @@
 var https = require('https');
 var parser = require('xml2json');
 var fs = require('fs');
-var qs = require('querystring');
 var path = require('path');
 var env = require(path.join(__dirname, 'env'));
 var _ = require('lodash');
 
-var pivotalOptions = {
-  host: 'www.pivotaltracker.com',
-  path: '/services/v3/projects/' + env.pivotal.PID + '/stories',
-  headers: { 'X-TrackerToken': env.pivotal.TOKEN}
+// TODO(justinabrahms): Support for subtasks? See story #14008073.
+
+var Importer = module.exports = function (options) {
+  this.options = Object.freeze(options);
+  _.bindAll(this, 'getSprintlyUsers', 'addToSprintly', 'ticketMapper', 'getLocalStories', 'getRemoteStories');
 };
 
-var sprintlyOptions = {
-  hostname: 'local.sprint.ly',
-  port: 9000,
-  path: '/api/products/' + env.sprintly.ID + '/items.json',
-  auth: env.sprintly.USER + ':' + env.sprintly.KEY,
-  method: 'POST'
+var ESTIMATE_MAPPER = {
+  0: '~',
+  1: 'S',
+  2: 'M',
+  3: 'M',
+  4: 'L',
+  8: 'XL'
 };
 
-var getSprintlyUsers = function (cb) {
-  var opts = _.cloneDeep(sprintlyOptions);
-  opts.path = '/api/products/' + env.sprintly.ID + '/people.json';
+Importer.prototype.getSprintlyUsers = function (pivotalStories, cb) {
+  var opts = _.cloneDeep(this.options.sprintly);
+  opts.path = '/api/products/' + this.options.importer.sprintlyProductId + '/people.json';
+  opts.method = 'GET';
 
-  https.get(opts, function (err, results) {
-    if (err) {
-      cb(err);
+  var req = https.get(opts, _.bind(function (res) {
+    if (res.statusCode >= 300) {
+      cb('Wrong status code on fetching users: ' + res.statusCode);
+      return;
     }
-    cb(null, _.zip(_.map(results, function (p) {
-      return [p.first_name + ' ' + p.last_name, p.id];
-    })));
+
+    var response = '';
+    res.on('data', function (d) {
+      response += d;
+    });
+
+    res.on('end', function () {
+      cb(null, pivotalStories, _.zipObject(_.map(JSON.parse(response), function (p) {
+        return [p.first_name + ' ' + p.last_name, p.id];
+      })));
+    });
+  }, this));
+
+  req.on('error', function (e) {
+    cb(e);
   });
+  req.end();
 };
 
-var addToSprintly = function(story) {
-  var options = sprintlyOptions;
+Importer.prototype.addToSprintly = function(story) {
+  console.log('adding item to sprintly');
+  return;
+ 
+  var options = _.deepClone(this.options.sprintly);
   options.headers = {
     'Content-Type': 'application/x-www-form-urlencoded',
     'Content-Length': story.length
@@ -53,37 +72,22 @@ var addToSprintly = function(story) {
   request.end();
 };
 
-var parseStories = function(stories) {
+/**
+ * Maps Pivotal style tickets to Sprintly style tickets
+ */
+Importer.prototype.ticketMapper = function(pivotalStories, sprintlyUsers, cb) {
   var parseScore = function(score) {
-    var result = +score.$t;
-    if (!result) {
-      result = '~';
-    } else if (result === 1) {
-      result = 'S';
-    } else if (result === 2) {
-      result = 'M';
-    } else if (result === 3) {
-      result = 'M';
-    } else if (result === 4) {
-      result = 'L';
-    } else if (result === 8) {
-      result = 'XL';
-    }
-    return result;
+    var result = +score.$t || 0;
+    return ESTIMATE_MAPPER[result];
   };
 
   var addStory = function(feature) {
-    var description = typeof feature.description === 'object' ? '' : feature.description;
-    description = description.replace(/(As|I)/g, function(str) {
-      return ',' + str;
-    });
-    description = description.replace('-', '');
     return {
       type: 'story',
       who: 'unknown',
       what: feature.name,
       why: 'unknown',
-      body: description,
+      body: feature.description,
       score: parseScore(feature.estimate),
       tags: feature.labels
     };
@@ -105,60 +109,98 @@ var parseStories = function(stories) {
     };
   };
 
-  return stories.map(function(story) {
+  cb(null, _.map(pivotalStories.stories.story, function(story) {
+    var item;
     switch(story.story_type) {
-      case 'feature':
-        return addStory(story);
-      case 'bug':
-        return addDefect(story);
-      case 'chore':
-        return addTask(story);
+    case 'feature':
+      item = addStory(story);
+      break;
+    case 'bug':
+      item = addDefect(story);
+      break;
+    case 'chore':
+      item = addTask(story);
+      break;
+    default:
+      return;
     }
+
+    item.created_by = sprintlyUsers[story.requested_by];
+    item.assigned_to = sprintlyUsers[story.owned_by];
+
+    return item;
+  }));
+};
+
+Importer.prototype.getLocalStories = function (cb) {
+  fs.readFile('pivotalData.xml', 'utf-8', function(err, resp) {
+    if (err) {
+      cb(new Error("Couldn't read pivotalData.xml"));
+    }
+    cb(null, parser.toJson(resp, {object: true}));
   });
 };
 
-var handleStories = function(data) {
-  var stories = data.stories.story;
-  stories = parseStories(stories);
-  var j = 0;
-  var poll = setInterval(function() {
-    if ( j < stories.length) {
-      addToSprintly(qs.stringify(stories[j]));
-      j++;
+Importer.prototype.getRemoteStories = function (cb) {
+  var response = '';
+  https.get(this.options.pivotal, _.bind(function(res) {
+    if (res.statusCode >= 300) {
+      cb('Wrong status code on fetching stories: ' + res.statusCode);
     }
-    else {
-      clearInterval(poll);
-    }
-  }, 250);
-};
 
-
-var getPivotalStories = function(options) {
-  if (options.local) {
-    fs.readFile('pivotalData.xml', 'utf-8', function(err, resp) {
-      if (err) {
-        throw new Error("Couldn't read pivotalData.xml");
-      }
-      handleStories(parser.toJson(resp, {object: true}));
+    res.on('data', function (chunk) {
+      response += chunk;
     });
-  }
-  else {
-    var response = '';
-    https.get(pivotalOptions, function(res) {
-      res.on('data', function (chunk) {
-        response += chunk;
-      });
-      res.on('end', function() {
+
+    res.on('end', _.bind(function() {
+      if (this.options.importer.writeFile) {
         fs.writeFileSync('pivotalData.xml', response);
-        handleStories(parser.toJson(response, {object: true}));
-      });
-    }).on('error', function(e) {
-      console.log('Got error: ' + e.message);
-    });
-  }
+      }
+      cb(null, parser.toJson(response, {object: true}));
+    }, this));
+
+  }, this)).on('error', function(e) {
+    cb(e.message);
+  });
 };
 
-
+/* istanbul ignore if  */
 if (require.main === module) {
-  getPivotalStories({local: false});
+  var async = require('async');
+  var opts = {
+    sprintly: {
+      hostname: 'local.sprint.ly',
+      port: 9000,
+      path: '/api/products/' + env.sprintly.ID + '/items.json',
+      auth: env.sprintly.USER + ':' + env.sprintly.KEY,
+      method: 'POST'
+    },
+    pivotal: {
+      host: 'www.pivotaltracker.com',
+      path: '/services/v3/projects/' + env.pivotal.PID + '/stories',
+      headers: { 'X-TrackerToken': env.pivotal.TOKEN}
+    },
+    importer: {
+      local: true,
+      writeFile: false,
+      sprintlyProductId: env.sprintly.ID
+    }
+  };
+
+  var imp = new Importer(opts);
+
+  var storyFetcher;
+  if (opts.importer.local) {
+    storyFetcher = imp.getLocalStories;
+  } else {
+    storyFetcher = imp.getRemoteStories;
+  }
+
+  async.waterfall(
+    [storyFetcher,
+     imp.getSprintlyUsers,
+     imp.ticketMapper,
+     imp.addToSprintly], function (err) {
+       console.log('final error: ', err);
+     });
 }
